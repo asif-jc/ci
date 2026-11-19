@@ -1,0 +1,85 @@
+# Shared test job for asif-jc's and cheenulabs' repositories: each repo calls it from a short stub
+# (README.md). It finds how to test the checkout the way Code Review Kit does (crk/facts/setup.py),
+# so one file serves Python and Node repos, and a repo with an odd setup passes `test-command`.
+# Its job is named "tests": superpi's merge audit requires every check on a merged head to pass.
+name: tests
+
+on:
+  workflow_call:
+    inputs:
+      test-command:
+        description: "Run this instead of the detected command"
+        type: string
+        default: ""
+      setup-command:
+        description: "Run this first instead of the detected setup"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect
+        id: detect
+        env:
+          SETUP: ${{ inputs.setup-command }}
+          TEST: ${{ inputs.test-command }}
+        run: |
+          set -eu
+          setup="$SETUP"; test="$TEST"; kind=custom
+          if [ -z "$test" ]; then
+            if [ -f package.json ] && jq -e '.scripts.test' package.json >/dev/null; then
+              kind=node; test="npm test"
+              [ -n "$setup" ] || { [ -f package-lock.json ] && setup="npm ci" || setup="npm install --no-audit --no-fund"; }
+            elif [ -f uv.lock ]; then
+              kind=uv; test="uv run pytest -q"; [ -n "$setup" ] || setup="uv sync --all-extras"
+            elif [ -f pyproject.toml ] || [ -n "$(find . -maxdepth 1 -name 'requirements*.txt')" ]; then
+              kind=python; test="python -m pytest -q"
+              if [ -z "$setup" ]; then
+                if [ -f pyproject.toml ] && grep -q '^\[project\]' pyproject.toml; then
+                  extras=$(python3 -c "import tomllib;d=tomllib.load(open('pyproject.toml','rb')).get('project',{}).get('optional-dependencies',{});print(','.join(e for e in ('test','tests','dev') if e in d))")
+                  setup="pip install -e .${extras:+[$extras]} pytest"
+                else
+                  setup="pip install pytest $(find . -maxdepth 1 -name 'requirements*.txt' | sed 's|^\./|-r |' | tr '\n' ' ')"
+                fi
+              fi
+            else
+              kind=none
+            fi
+          fi
+          {
+            echo "kind=$kind"
+            echo "setup<<EOF"; echo "$setup"; echo "EOF"
+            echo "test<<EOF"; echo "$test"; echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "kind: $kind | setup: ${setup:-none} | test: ${test:-none}"
+
+      - uses: actions/setup-python@v5
+        if: steps.detect.outputs.kind == 'python' || steps.detect.outputs.kind == 'custom'
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v6
+        if: steps.detect.outputs.kind == 'uv'
+      - uses: actions/setup-node@v4
+        if: steps.detect.outputs.kind == 'node'
+        with:
+          node-version: "22"
+
+      - name: Setup
+        if: steps.detect.outputs.setup != ''
+        run: ${{ steps.detect.outputs.setup }}
+
+      - name: Test
+        if: steps.detect.outputs.kind != 'none'
+        run: ${{ steps.detect.outputs.test }}
+
+      - name: No tests
+        if: steps.detect.outputs.kind == 'none'
+        run: echo "No test setup detected; nothing to run."
